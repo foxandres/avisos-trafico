@@ -1,18 +1,26 @@
 #!/usr/bin/env python3
 """
-Bot de avisos de tráfico -> Telegram
+Bot de avisos de tráfico -> Telegram  (v3)
 
 Fuentes oficiales:
   - DGT (Punto de Acceso Nacional): incidencias en carreteras.
   - Ayuntamiento de Madrid: incidencias en calles de la ciudad.
 
-Qué hace en cada ejecución:
-  1. Descarga las incidencias y se queda con las de tus tramos y calles.
-  2. Te avisa de las IMPORTANTES nuevas (cortes, accidentes, retenciones, meteorología…).
-     Las obras que no cortan la vía no avisan: solo se cuentan en el panel.
-  3. Avisa cuando una incidencia de la que te avisó desaparece.
-  4. En horario de silencio solo avisa de cortes totales; el resto llega al acabar el silencio.
-  5. Mantiene un panel de estado fijado en el chat, actualizado sin notificaciones.
+Qué te AVISA (con notificación):
+  - Cortes de carretera o calzada, accidentes, meteorología adversa, retenciones con tráfico
+    detenido o colas, salidas/entradas cerradas.
+  - Si algo que ya te avisó empeora a corte total.
+  - Cuando se resuelve un corte o accidente del que te avisó (sin sonido).
+
+Qué NO avisa (solo aparece contado en el panel fijado):
+  - Obras sin corte, vehículos detenidos, obstáculos, tráfico lento o denso.
+
+Para no repetir:
+  - Una incidencia de la DGT con varias partes (corte + desvío + retención) es UN solo aviso.
+  - Algo "resuelto" tiene que llevar 15 min sin aparecer.
+  - Si aparece otra incidencia del mismo tipo en el mismo punto (±2 km, mismo sentido)
+    en la última hora, no se vuelve a avisar.
+  - En horario de silencio solo avisan los cortes totales; lo demás llega al acabar.
 
 Tus tramos y calles NO están en este código: se leen del secret CONFIG (JSON).
 Variables de entorno: TELEGRAM_TOKEN, TELEGRAM_CHAT_ID y CONFIG.
@@ -29,7 +37,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 try:
     from zoneinfo import ZoneInfo
@@ -42,6 +50,12 @@ URL_MADRID = "https://datos.madrid.es/egob/catalogo/202062-0-trafico-incidencias
 FICHERO_ESTADO = os.path.join(os.path.dirname(os.path.abspath(__file__)), "estado.json")
 XSI_TYPE = "{http://www.w3.org/2001/XMLSchema-instance}type"
 NUM = re.compile(r"^-?\d+(\.\d+)?$")
+VERSION_ESTADO = 3
+
+AUSENCIAS_PARA_RESUELTO = 3        # revisiones seguidas sin aparecer (~15 min)
+VENTANA_REPETIDOS = timedelta(minutes=60)
+DISTANCIA_REPETIDOS_KM = 2.0
+CLASES_CON_RESUELTO = {"corte", "accidente"}
 
 
 # ============================================================
@@ -94,14 +108,18 @@ def parse_fecha(iso):
         return None
 
 
-def hora_local(dt, con_dia_si_no_es_hoy=True):
+def hora_local(dt, ahora=None, con_dia=True):
     if not dt:
         return ""
     dt = dt.astimezone(ZONA)
-    hoy = datetime.now(ZONA).date()
-    if con_dia_si_no_es_hoy and dt.date() != hoy:
+    hoy = (ahora or datetime.now(timezone.utc)).astimezone(ZONA).date()
+    if con_dia and dt.date() != hoy:
         return dt.strftime("%d/%m %H:%M")
     return dt.strftime("%H:%M")
+
+
+def fkm(k):
+    return f"{round(k, 1):g}".replace(".", ",")
 
 
 def esc(texto):
@@ -113,7 +131,7 @@ def enlace_mapa(lat, lon):
 
 
 def descargar(url):
-    req = urllib.request.Request(url, headers={"User-Agent": "avisos-trafico-bot/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "avisos-trafico-bot/3.0"})
     with urllib.request.urlopen(req, timeout=120) as resp:
         return resp.read()
 
@@ -128,23 +146,23 @@ def en_silencio(cfg, ahora_utc=None):
 
 
 # ============================================================
-# Textos de la DGT
+# Clasificación de la DGT
 # ============================================================
 
-CAUSAS = {
-    "accident": ("💥", "Accidente"),
-    "abnormalTraffic": ("🚗", "Retención"),
-    "vehicleObstruction": ("⚠️", "Vehículo detenido"),
-    "obstruction": ("⚠️", "Obstáculo en la vía"),
-    "generalObstruction": ("⚠️", "Obstáculo en la vía"),
-    "animalPresenceObstruction": ("⚠️", "Animales en la vía"),
-    "environmentalObstruction": ("⚠️", "Obstáculo en la vía"),
-    "infrastructureDamageObstruction": ("⚠️", "Daños en la vía"),
-    "poorEnvironment": ("🌧️", "Meteorología adversa"),
-    "poorRoadInfrastructure": ("⚠️", "Problema en la vía"),
-    "publicEvent": ("⚠️", "Evento"),
-    "fire": ("🔥", "Incendio"),
-    "roadMaintenance": ("🚧", "Obras"),
+NOMBRES_CAUSA = {
+    "accident": "Accidente",
+    "abnormalTraffic": "Retención",
+    "vehicleObstruction": "Vehículo detenido",
+    "obstruction": "Obstáculo en la vía",
+    "generalObstruction": "Obstáculo en la vía",
+    "animalPresenceObstruction": "Animales en la vía",
+    "environmentalObstruction": "Obstáculo en la vía",
+    "infrastructureDamageObstruction": "Daños en la vía",
+    "poorEnvironment": "Meteorología adversa",
+    "poorRoadInfrastructure": "Problema en la vía",
+    "publicEvent": "Evento",
+    "fire": "Incendio",
+    "roadMaintenance": "Obras",
 }
 
 TIPOS_REGISTRO = {
@@ -159,6 +177,9 @@ TIPOS_REGISTRO = {
     "sit:PublicEvent": "publicEvent",
 }
 
+OBSTACULOS = {"vehicleObstruction", "obstruction", "generalObstruction",
+              "animalPresenceObstruction", "environmentalObstruction"}
+
 METEO = {
     "snowfall": ("❄️", "Nieve"), "ice": ("🧊", "Hielo"), "blackIce": ("🧊", "Hielo"),
     "fog": ("🌫️", "Niebla"), "denseFog": ("🌫️", "Niebla densa"),
@@ -166,13 +187,11 @@ METEO = {
     "flooding": ("🌊", "Inundación"), "snowOnTheRoad": ("❄️", "Nieve en la calzada"),
 }
 
-TRAFICO = {
-    "stationaryTraffic": "tráfico detenido", "queuingTraffic": "colas",
-    "slowTraffic": "tráfico lento", "heavyTraffic": "tráfico denso",
-}
+TRAFICO_SERIO = {"stationaryTraffic": "tráfico detenido", "queuingTraffic": "colas"}
+TRAFICO_LEVE = {"slowTraffic": "tráfico lento", "heavyTraffic": "tráfico denso"}
 
 CIERRES_TOTALES = {"roadClosed", "carriagewayClosures"}
-CIERRES = CIERRES_TOTALES | {"exitClosed", "entryClosed", "contraflow"}
+CIERRES_PARCIALES = {"exitClosed", "entryClosed", "contraflow"}
 
 EFECTOS = {
     "roadClosed": "carretera cortada",
@@ -182,7 +201,7 @@ EFECTOS = {
     "contraflow": "circulación por el carril contrario",
     "narrowLanes": "carriles estrechos",
     "singleAlternateLineTraffic": "paso alternativo",
-    "lanesDeviated": "carriles desviados",
+    "lanesDeviated": "desvío de carriles",
     "newRoadworksLayout": "cambio de trazado",
     "hardShoulderClosed": "arcén cortado",
 }
@@ -193,6 +212,23 @@ CARRILES = {
     "middleLane": "carril central", "rightHardShoulder": "arcén derecho",
     "leftHardShoulder": "arcén izquierdo",
 }
+
+# clase: (rango de gravedad, icono, ¿avisa?)
+CLASES = {
+    "corte":     (0, "🚫", True),
+    "accidente": (1, "💥", True),
+    "meteo":     (2, "🌧️", True),
+    "retencion": (3, "🚗", True),
+    "cierre":    (4, "⛔", True),
+    "otro":      (4, "⚠️", True),
+    "lento":     (5, "🚗", False),
+    "vehiculo":  (6, "⚠️", False),
+    "obra":      (7, "🚧", False),
+}
+
+NOMBRE_MENORES = {"lento": ("tramo con tráfico lento", "tramos con tráfico lento"),
+                  "vehiculo": ("vehículo detenido u obstáculo", "vehículos detenidos u obstáculos"),
+                  "obra": ("obra sin corte", "obras sin corte")}
 
 
 def campos_registro(elem):
@@ -206,6 +242,55 @@ def campos_registro(elem):
         if texto:
             campos.setdefault(nombre, []).append(texto)
     return campos
+
+
+def analizar_registro(elem, campos):
+    """Clasifica un registro de la DGT. Devuelve dict con clase, icono y titular."""
+    causa = TIPOS_REGISTRO.get(elem.get(XSI_TYPE, "")) or (campos.get("causeType") or [""])[0]
+    gestion = (campos.get("roadOrCarriagewayOrLaneManagementType") or [""])[0]
+    carriles = [CARRILES.get(c, c) for c in dict.fromkeys(campos.get("laneUsage", []))]
+    tipos_trafico = campos.get("abnormalTrafficType", [])
+    meteo = next((METEO[v] for v in campos.get("poorEnvironmentType", [])
+                  + campos.get("weatherRelatedRoadConditionType", []) if v in METEO), None)
+
+    if gestion == "laneClosures":
+        if carriles == ["todos los carriles"]:
+            gestion, efecto = "carriagewayClosures", "calzada cortada"
+        else:
+            efecto = f"{', '.join(carriles)} cortado" if carriles else "carril cortado"
+    else:
+        efecto = EFECTOS.get(gestion, "")
+
+    serio = next((TRAFICO_SERIO[v] for v in tipos_trafico if v in TRAFICO_SERIO), "")
+    leve = next((TRAFICO_LEVE[v] for v in tipos_trafico if v in TRAFICO_LEVE), "")
+    nombre = NOMBRES_CAUSA.get(causa, "")
+    icono_meteo = None
+    if meteo:
+        icono_meteo, nombre = meteo
+
+    if gestion in CIERRES_TOTALES:
+        clase = "corte"
+    elif causa == "accident":
+        clase = "accidente"
+    elif meteo or causa == "poorEnvironment":
+        clase = "meteo"
+    elif causa == "abnormalTraffic" or tipos_trafico:
+        clase = "retencion" if serio or not leve else "lento"
+    elif causa in OBSTACULOS:
+        clase = "vehiculo"
+    elif causa in ("roadMaintenance", ""):
+        clase = "cierre" if gestion in CIERRES_PARCIALES else "obra"
+    else:
+        clase = "otro"
+
+    rango, icono, avisa = CLASES[clase]
+    if clase == "meteo" and icono_meteo:
+        icono = icono_meteo
+    partes = [p for p in (nombre, serio or leve, efecto) if p]
+    titular = " · ".join(partes) or "Incidencia"
+    resto = " · ".join(p for p in (serio or leve, efecto) if p)
+    return {"clase": clase, "rango": rango, "icono": icono, "avisa": avisa, "nombre": nombre,
+            "resto": resto, "titular": titular[:1].upper() + titular[1:]}
 
 
 def tramo_que_coincide(tramos, carretera, kms, lons, lats):
@@ -227,105 +312,101 @@ def tramo_que_coincide(tramos, carretera, kms, lons, lats):
     return None
 
 
-def describir_sentido(campos, carretera, cfg):
-    d = (campos.get("tpegDirectionRoad") or ["unknown"])[0]
-    if d == "both":
+def describir_sentido(direccion, carretera, cfg):
+    if direccion == "both":
         return "ambos sentidos"
     if carretera in cfg["hacia_madrid_negativo"]:
-        return {"positive": "saliendo de Madrid", "negative": "hacia Madrid"}.get(d, "")
-    return {"positive": "km crecientes", "negative": "km decrecientes"}.get(d, "")
+        return {"positive": "saliendo de Madrid", "negative": "hacia Madrid"}.get(direccion, "")
+    return {"positive": "km crecientes", "negative": "km decrecientes"}.get(direccion, "")
 
 
-def describir_dgt(elem, campos):
-    """Devuelve (icono, titular, importante, corte_total)."""
-    causa = TIPOS_REGISTRO.get(elem.get(XSI_TYPE, "")) or (campos.get("causeType") or [""])[0]
-    gestion = (campos.get("roadOrCarriagewayOrLaneManagementType") or [""])[0]
-    carriles = [CARRILES.get(c, c) for c in dict.fromkeys(campos.get("laneUsage", []))]
-
-    icono, nombre_causa = CAUSAS.get(causa, ("⚠️", "Incidencia"))
-    for v in campos.get("poorEnvironmentType", []) + campos.get("weatherRelatedRoadConditionType", []):
-        if v in METEO:
-            icono, nombre_causa = METEO[v]
-            break
-    detalle_trafico = next((TRAFICO[v] for v in campos.get("abnormalTrafficType", []) if v in TRAFICO), "")
-
-    if gestion == "laneClosures":
-        efecto = (("todos los carriles cortados" if carriles == ["todos los carriles"]
-                   else f"{', '.join(carriles)} cortado") if carriles else "carril cortado")
-    else:
-        efecto = EFECTOS.get(gestion, "")
-    if gestion == "laneClosures" and carriles == ["todos los carriles"]:
-        gestion = "carriagewayClosures"
-
-    corte_total = gestion in CIERRES_TOTALES
-    es_obra = causa in ("roadMaintenance", "") and not detalle_trafico
-    importante = (gestion in CIERRES) or not es_obra
-    if corte_total:
-        icono = "🚫"
-
-    partes = [nombre_causa if causa or not efecto else ""]
-    if detalle_trafico:
-        partes.append(detalle_trafico)
-    if efecto:
-        partes.append(efecto)
-    titular = " · ".join(p for p in partes if p)
-    titular = titular[:1].upper() + titular[1:] if titular else "Incidencia"
-    return icono, titular, importante, corte_total
+def registros_de_situacion(sit, cfg, ahora):
+    """Registros válidos de una situación de la DGT que caen en tus tramos."""
+    validos = []
+    for rec in sit:
+        if local(rec.tag) != "situationRecord":
+            continue
+        campos = campos_registro(rec)
+        carretera = (campos.get("roadName") or [""])[0].upper().replace(" ", "")
+        kms = [float(k) for k in campos.get("kilometerPoint", []) if NUM.match(k)]
+        lons = [float(x) for x in campos.get("longitude", []) if NUM.match(x)]
+        lats = [float(x) for x in campos.get("latitude", []) if NUM.match(x)]
+        tramo = tramo_que_coincide(cfg["tramos"], carretera, kms, lons, lats)
+        if not tramo:
+            continue
+        if (campos.get("validityStatus") or ["active"])[0] not in ("active", "planned"):
+            continue
+        inicio = parse_fecha((campos.get("overallStartTime") or [""])[0])
+        fin = parse_fecha((campos.get("overallEndTime") or [""])[0])
+        if (inicio and inicio > ahora) or (fin and fin < ahora):
+            continue
+        info = analizar_registro(rec, campos)
+        info.update({"tramo": tramo, "carretera": carretera, "kms": kms, "lats": lats, "lons": lons,
+                     "municipios": campos.get("municipality", []), "inicio": inicio, "fin": fin,
+                     "direccion": (campos.get("tpegDirectionRoad") or ["unknown"])[0]})
+        validos.append(info)
+    return validos
 
 
 def incidencias_dgt(cfg, ahora):
-    tramos = cfg["tramos"]
-    carreteras = {t["carretera"] for t in tramos}
+    carreteras = {t["carretera"] for t in cfg["tramos"]}
     if not carreteras:
         return {}
     resultado = {}
     for _ev, elem in ET.iterparse(io.BytesIO(descargar(URL_DGT)), events=("end",)):
-        if local(elem.tag) != "situationRecord":
+        if local(elem.tag) != "situation":
             continue
         try:
-            campos = campos_registro(elem)
-            carretera = (campos.get("roadName") or [""])[0].upper().replace(" ", "")
-            if carretera not in carreteras:
+            # Descarte rápido: ninguna carretera de la situación nos interesa
+            nombres = {(e.text or "").strip().upper().replace(" ", "")
+                       for e in elem.iter() if local(e.tag) == "roadName"}
+            if not nombres & carreteras:
                 continue
-            kms = [float(k) for k in campos.get("kilometerPoint", []) if NUM.match(k)]
-            lons = [float(x) for x in campos.get("longitude", []) if NUM.match(x)]
-            lats = [float(x) for x in campos.get("latitude", []) if NUM.match(x)]
-            tramo = tramo_que_coincide(tramos, carretera, kms, lons, lats)
-            if not tramo:
+            registros = registros_de_situacion(elem, cfg, ahora)
+            if not registros:
                 continue
-            if (campos.get("validityStatus") or ["active"])[0] not in ("active", "planned"):
-                continue
-            inicio = parse_fecha((campos.get("overallStartTime") or [""])[0])
-            fin = parse_fecha((campos.get("overallEndTime") or [""])[0])
-            if inicio and inicio > ahora:
-                continue  # todavía no ha empezado
-            if fin and fin < ahora:
-                continue
-
-            icono, titular, importante, corte_total = describir_dgt(elem, campos)
+            registros.sort(key=lambda r: r["rango"])
+            p = registros[0]  # el más grave manda
+            kms = [k for r in registros if r["carretera"] == p["carretera"] for k in r["kms"]]
             km_txt = ""
             if kms:
-                km_txt = f"km {min(kms):g}" if min(kms) == max(kms) else f"km {min(kms):g}–{max(kms):g}"
-            municipios = list(dict.fromkeys(campos.get("municipality", [])))
-            lugar = " · ".join(p for p in (f"{carretera} {km_txt}".strip(), ", ".join(municipios[:2])) if p)
+                km_txt = f"km {fkm(min(kms))}" if round(min(kms), 1) == round(max(kms), 1) \
+                    else f"km {fkm(min(kms))}–{fkm(max(kms))}"
+            municipios = list(dict.fromkeys(m for r in registros for m in r["municipios"]))
+            lugar = " · ".join(x for x in (f"{p['carretera']} {km_txt}".strip(), ", ".join(municipios[:2])) if x)
 
-            detalles = [describir_sentido(campos, carretera, cfg)]
+            titular = p["titular"]
+            extra = [(r["resto"] if r["nombre"] == p["nombre"] and r["resto"] else r["titular"]).lower()
+                     for r in registros[1:] if r["titular"] != titular]
+            extra = [e for e in dict.fromkeys(extra) if e and e not in titular.lower()][:2]
+
+            detalles = [describir_sentido(p["direccion"], p["carretera"], cfg)]
+            inicio = min((r["inicio"] for r in registros if r["inicio"]), default=None)
+            fin = max((r["fin"] for r in registros if r["fin"]), default=None)
             if fin:
-                detalles.append(f"hasta {hora_local(fin)}")
+                detalles.append(f"hasta {hora_local(fin, ahora)}")
             elif inicio:
-                detalles.append(f"desde {hora_local(inicio)}")
-            if lats and lons:
-                detalles.append(enlace_mapa((lats[0] + lats[-1]) / 2, (lons[0] + lons[-1]) / 2))
+                detalles.append(f"desde {hora_local(inicio, ahora)}")
+            if p["lats"] and p["lons"]:
+                detalles.append(enlace_mapa((p["lats"][0] + p["lats"][-1]) / 2,
+                                            (p["lons"][0] + p["lons"][-1]) / 2))
 
-            rid = "dgt-" + (elem.get("id") or str(abs(hash(str(sorted(campos.items()))))))
+            texto = f"{p['icono']} <b>{esc(lugar)}</b>\n{esc(titular)}"
+            if extra:
+                texto += f"\n<i>También: {esc('; '.join(extra))}</i>"
+            texto += "\n" + " · ".join(d for d in detalles if d)
+
+            rid = "dgt-" + (elem.get("id") or str(abs(hash(lugar + titular))))
             resultado[rid] = {
-                "grupo": tramo["nombre"],
-                "icono": icono,
-                "importante": importante,
-                "corte_total": corte_total,
-                "texto": (f"{icono} <b>{esc(lugar)}</b>\n{esc(titular)}\n"
-                          + " · ".join(d for d in detalles if d)),
+                "grupo": p["tramo"]["nombre"],
+                "clase": p["clase"],
+                "importante": any(r["avisa"] for r in registros),
+                "corte_total": p["clase"] == "corte",
+                "texto": texto,
                 "resumen": f"{lugar}: {titular}",
+                "carretera": p["carretera"],
+                "direccion": p["direccion"],
+                "km": round(sum(kms) / len(kms), 1) if kms else None,
             }
         finally:
             elem.clear()
@@ -377,13 +458,13 @@ def incidencias_madrid(cfg, ahora):
         corte_total = bool(CORTE_TOTAL_MADRID.search(texto_norm))
         es_obra = c.get("es_obras") == "S"
         es_accidente = c.get("es_accidente") == "S"
-        importante = corte_total or not es_obra
-        icono = "🚫" if corte_total else "💥" if es_accidente else "🚧" if es_obra else "⚠️"
+        clase = "corte" if corte_total else "accidente" if es_accidente else "obra" if es_obra else "otro"
+        icono = CLASES[clase][1]
         tipo = c.get("nom_tipo_incidencia") or ("Obras" if es_obra else "Incidencia")
 
         detalles = []
         if fin:
-            detalles.append(f"hasta {hora_local(fin)}")
+            detalles.append(f"hasta {hora_local(fin, ahora)}")
         try:
             lat, lon = float(c.get("latitud", "nan")), float(c.get("longitud", "nan"))
             if lat == lat and lon == lon:  # no es NaN
@@ -396,8 +477,9 @@ def incidencias_madrid(cfg, ahora):
         if detalles:
             cuerpo += "\n" + " · ".join(detalles)
         resultado[rid] = {
-            "grupo": "Calles de Madrid", "icono": icono, "importante": importante,
+            "grupo": "Calles de Madrid", "clase": clase, "importante": clase != "obra",
             "corte_total": corte_total, "texto": cuerpo, "resumen": f"{calle}: {tipo}",
+            "carretera": "MADRID:" + calle, "direccion": "both", "km": None,
         }
     return resultado
 
@@ -444,23 +526,27 @@ def texto_panel(cfg, actuales, ahora):
     grupos = [t["nombre"] for t in cfg["tramos"]]
     if cfg["calles"]:
         grupos.append("Calles de Madrid")
-    lineas = [f"🚦 <b>Estado del tráfico</b> · {hora_local(ahora, False)}"]
-    obras_menores = {}
+    lineas = [f"🚦 <b>Estado del tráfico</b> · {hora_local(ahora, ahora, False)}"]
+    menores = {}
     for g in grupos:
-        del_grupo = [v for v in actuales.values() if v["grupo"] == g]
+        del_grupo = sorted((v for v in actuales.values() if v["grupo"] == g),
+                           key=lambda v: CLASES[v["clase"]][0])
         importantes = [v for v in del_grupo if v["importante"]]
-        menores = len(del_grupo) - len(importantes)
-        if menores:
-            obras_menores[g] = menores
+        for v in del_grupo:
+            if not v["importante"]:
+                menores[v["clase"]] = menores.get(v["clase"], 0) + 1
         if not importantes:
             lineas.append(f"\n✅ {esc(g)}")
             continue
         lineas.append(f"\n<b>{esc(g)}</b>\n" + "\n\n".join(v["texto"] for v in importantes))
-    if obras_menores:
-        total = sum(obras_menores.values())
-        lineas.append(f"\n🚧 {total} obra{'s' if total > 1 else ''} sin cortes de vía "
-                      f"({', '.join(esc(g) for g in obras_menores)})")
-    lineas.append("\n<i>Se actualiza solo cada pocos minutos.</i>")
+    if menores:
+        partes = []
+        for clase in ("lento", "vehiculo", "obra"):
+            n = menores.get(clase)
+            if n:
+                uno, varios = NOMBRE_MENORES[clase]
+                partes.append(f"{n} {uno if n == 1 else varios}")
+        lineas.append("\n<i>Sin aviso: " + ", ".join(partes) + ".</i>")
     return "\n".join(lineas)
 
 
@@ -503,14 +589,40 @@ def guardar_estado(estado):
         json.dump(estado, f, ensure_ascii=False, sort_keys=True)
 
 
+def huella(v, ahora):
+    return {"resumen": v["resumen"], "clase": v["clase"], "corte": v["corte_total"],
+            "carretera": v["carretera"], "direccion": v["direccion"], "km": v["km"],
+            "t": ahora.isoformat()}
+
+
+def es_repetida(v, recientes, ahora):
+    """¿Se avisó hace poco de algo igual o más grave en el mismo punto?"""
+    rango = CLASES[v["clase"]][0]
+    for r in recientes:
+        if ahora - datetime.fromisoformat(r["t"]) > VENTANA_REPETIDOS:
+            continue
+        if r["carretera"] != v["carretera"]:
+            continue
+        if "both" not in (r["direccion"], v["direccion"]) and r["direccion"] != v["direccion"]:
+            continue
+        if r["km"] is not None and v["km"] is not None and abs(r["km"] - v["km"]) > DISTANCIA_REPETIDOS_KM:
+            continue
+        if CLASES[r["clase"]][0] <= rango:
+            return True
+    return False
+
+
 def main(ahora=None):
     cfg = cargar_config()
     ahora = ahora or datetime.now(timezone.utc)
-    estado_previo = cargar_estado()
-    primera_vez = estado_previo is None or estado_previo.get("version") != 2
-    estado = estado_previo if not primera_vez else {}
+    previo = cargar_estado() or {}
+    version_previa = previo.get("version")
+    estado = previo if version_previa == VERSION_ESTADO else {"panel_id": previo.get("panel_id")}
     previas = estado.get("incidencias", {})
     notificadas = estado.get("notificadas", {})
+    ausencias = estado.get("ausencias", {})
+    recientes = [r for r in estado.get("recientes", [])
+                 if ahora - datetime.fromisoformat(r["t"]) <= VENTANA_REPETIDOS]
 
     actuales, errores = {}, []
     for nombre, funcion, prefijo in (("DGT", incidencias_dgt, "dgt-"),
@@ -524,34 +636,65 @@ def main(ahora=None):
     silencio = en_silencio(cfg, ahora)
     importantes = {k: v for k, v in actuales.items() if v["importante"]}
 
-    if primera_vez:
-        # Arranque: no avisamos de lo que ya había; el panel lo muestra todo.
-        notificadas = {k: v["resumen"] for k, v in importantes.items()}
-        enviar("🤖 <b>Bot de tráfico actualizado.</b>\n"
-               "Te he dejado arriba un panel fijado con el estado de tus tramos: "
-               "se actualiza solo y sin hacer ruido. Ábrelo antes de salir.\n\n"
-               "A partir de ahora solo te avisaré de cortes, accidentes, retenciones y meteorología "
-               "(las obras que no cortan la vía no avisan).", silencioso=True)
+    if version_previa != VERSION_ESTADO:
+        # Arranque o actualización: no avisamos de lo que ya había; el panel lo muestra.
+        notificadas = {k: huella(v, ahora) for k, v in importantes.items()}
+        ausencias = {}
+        if version_previa is None:
+            enviar("🤖 <b>Bot de tráfico activado.</b>\nArriba tienes un panel fijado con el estado "
+                   "de tus tramos; se actualiza solo y sin sonar.", silencioso=True)
     else:
-        a_avisar = {k: v for k, v in importantes.items()
-                    if k not in notificadas and (not silencio or v["corte_total"])}
-        resueltas = {k: r for k, r in notificadas.items() if k not in actuales}
-        if a_avisar:
-            cabecera = "🚨 <b>Nueva incidencia</b>" if len(a_avisar) == 1 else f"🚨 <b>{len(a_avisar)} incidencias nuevas</b>"
-            enviar(cabecera + "\n\n" + "\n\n".join(v["texto"] for v in a_avisar.values()))
-            notificadas.update({k: v["resumen"] for k, v in a_avisar.items()})
-        if resueltas and not silencio:
-            enviar("✅ <b>Resuelto</b>\n" + "\n".join("• " + esc(r) for r in resueltas.values()), silencioso=True)
-            for k in resueltas:
-                notificadas.pop(k, None)
+        nuevas, empeoran = {}, {}
+        for k, v in importantes.items():
+            if k in notificadas:
+                if v["corte_total"] and not notificadas[k].get("corte"):
+                    empeoran[k] = v
+                continue
+            if silencio and not v["corte_total"]:
+                continue  # se queda pendiente hasta que acabe el silencio
+            if es_repetida(v, recientes, ahora):
+                notificadas[k] = huella(v, ahora)  # lo damos por avisado, sin mensaje
+                continue
+            nuevas[k] = v
+
+        bloques = []
+        if nuevas:
+            bloques.append(("🚨 <b>Nueva incidencia</b>" if len(nuevas) == 1
+                            else f"🚨 <b>{len(nuevas)} incidencias nuevas</b>"))
+            bloques.extend(v["texto"] for v in sorted(nuevas.values(), key=lambda v: CLASES[v["clase"]][0]))
+        if empeoran:
+            bloques.append("⬆️ <b>Empeora: ahora hay corte</b>")
+            bloques.extend(v["texto"] for v in empeoran.values())
+        if bloques:
+            enviar("\n\n".join(bloques))
+        for k, v in {**nuevas, **empeoran}.items():
+            notificadas[k] = huella(v, ahora)
+            recientes.append(notificadas[k])
+
+        # Resueltas: solo tras varias revisiones seguidas sin aparecer, y fuera del silencio
+        resueltas = []
+        for k in list(notificadas):
+            if k in actuales:
+                ausencias.pop(k, None)
+                continue
+            if silencio:
+                continue
+            ausencias[k] = ausencias.get(k, 0) + 1
+            if ausencias[k] >= AUSENCIAS_PARA_RESUELTO:
+                info = notificadas.pop(k)
+                ausencias.pop(k, None)
+                if info["clase"] in CLASES_CON_RESUELTO:
+                    resueltas.append(info["resumen"])
+        if resueltas:
+            enviar("✅ <b>Resuelto</b>\n" + "\n".join("• " + esc(r) for r in resueltas), silencioso=True)
 
     # Errores persistentes (unos 30 min seguidos con revisión cada 5 min)
     fallos = estado.get("fallos_seguidos", 0) + 1 if errores else 0
     if fallos == 6:
         enviar("⚠️ No consigo leer alguna fuente de datos desde hace un rato:\n" + "\n".join(errores))
 
-    estado.update({"version": 2, "incidencias": actuales, "notificadas": notificadas,
-                   "fallos_seguidos": fallos})
+    estado.update({"version": VERSION_ESTADO, "incidencias": actuales, "notificadas": notificadas,
+                   "ausencias": ausencias, "recientes": recientes, "fallos_seguidos": fallos})
     try:
         actualizar_panel(cfg, estado, actuales, ahora)
     except RuntimeError as e:
@@ -559,7 +702,7 @@ def main(ahora=None):
     guardar_estado(estado)
 
     # El registro de GitHub es público en un repositorio público: solo contamos, sin detalles.
-    print(f"OK · {len(actuales)} incidencias ({len(importantes)} importantes) · "
+    print(f"OK · {len(actuales)} incidencias ({len(importantes)} con aviso) · "
           f"silencio={'sí' if silencio else 'no'} · errores={len(errores)}")
     for e in errores:
         print("  error:", e.split(":")[0])
