@@ -12,7 +12,9 @@ Qué te AVISA (con notificación):
     detenido o colas, salidas/entradas cerradas.
   - Avisos de AEMET en las zonas de tus carreteras ("zonas_aviso" en CONFIG): nevadas (desde amarillo) y lluvias o tormentas
     (solo rojo, configurable).
+  - Cadenas o neumáticos de invierno obligatorios (si la DGT lo publica).
   - Si algo que ya te avisó empeora a corte total.
+  - A las 21:00, sin sonido: previsión de avisos de AEMET para mañana en tus carreteras.
   - Cuando se resuelve un corte o accidente del que te avisó (sin sonido).
 
 Qué NO avisa (aparece en el panel fijado, una línea corta cada una):
@@ -95,6 +97,7 @@ def cargar_config():
     meteo = cfg.setdefault("avisos_meteo", cfg.get("aemet", {}))
     meteo.setdefault("nieve_desde", "amarillo")
     meteo.setdefault("lluvia_tormenta_desde", "rojo")
+    meteo.setdefault("prevision_hora", 21)       # hora local del aviso de "mañana"; null para no enviarlo
     for t in cfg["tramos"]:
         t["carretera"] = t["carretera"].upper().replace(" ", "")
     return cfg
@@ -145,6 +148,19 @@ def dia_y_hora(dt, ahora):
     else:
         dia = dt.strftime("%d/%m")
     return f"{dia} {dt.strftime('%H:%M')}"
+
+
+def hace(dt, ahora):
+    """'hace 25 min', 'hace 2 h 15 min', 'hace 3 días'."""
+    minutos = int((ahora - dt).total_seconds() // 60)
+    if minutos < 1:
+        return "ahora mismo"
+    if minutos < 60:
+        return f"hace {minutos} min"
+    if minutos < 24 * 60:
+        h, m = divmod(minutos, 60)
+        return f"hace {h} h" + (f" {m} min" if m and h < 6 else "")
+    return f"hace {minutos // (24 * 60)} día" + ("s" if minutos >= 48 * 60 else "")
 
 
 def fkm(k):
@@ -205,6 +221,7 @@ TIPOS_REGISTRO = {
     "sit:MaintenanceWorks": "roadMaintenance",
     "sit:Roadworks": "roadMaintenance",
     "sit:PublicEvent": "publicEvent",
+    "sit:WinterDrivingManagement": "winterDriving",
 }
 
 OBSTACULOS = {"vehicleObstruction", "obstruction", "generalObstruction",
@@ -234,6 +251,16 @@ EFECTOS = {
     "lanesDeviated": "desvío de carriles",
     "newRoadworksLayout": "cambio de trazado",
     "hardShoulderClosed": "arcén cortado",
+    "intermittentShortTermClosures": "cortes intermitentes",
+}
+
+# Conducción invernal (DATEX II: WinterDrivingManagement / winterEquipmentManagementType)
+INVIERNO = {
+    "useSnowChains": "cadenas obligatorias",
+    "useSnowChainsOrTyres": "cadenas o neumáticos de invierno obligatorios",
+    "useSnowTyres": "neumáticos de invierno obligatorios",
+    "winterEquipmentOnBoardRequired": "llevar cadenas en el vehículo",
+    "doNotUseStudTyres": "prohibidos neumáticos de clavos",
 }
 
 CARRILES = {
@@ -249,6 +276,7 @@ CLASES = {
     "aemet3":    (0, "🔴", True),   # aviso rojo de AEMET
     "accidente": (1, "💥", True),
     "aemet2":    (2, "🟠", True),   # aviso naranja
+    "cadenas":   (2, "⛓️", True),   # cadenas / neumáticos de invierno obligatorios
     "meteo":     (2, "🌧️", True),
     "aemet1":    (3, "🟡", True),   # aviso amarillo
     "retencion": (3, "🚗", True),
@@ -266,8 +294,8 @@ def campos_registro(elem):
         if len(e):
             continue
         nombre = local(e.tag)
-        texto = e.get("_extendedValue") if nombre == "laneUsage" and e.get("_extendedValue") \
-            else (e.text or "").strip()
+        # Valores ampliados de la DGT: <x _extendedValue="algo">_extended</x>
+        texto = e.get("_extendedValue") or (e.text or "").strip()
         if texto:
             campos.setdefault(nombre, []).append(texto)
     return campos
@@ -297,8 +325,16 @@ def analizar_registro(elem, campos, kms=()):
     if meteo:
         icono_meteo, nombre = meteo
 
+    invierno = next((INVIERNO[v] for v in campos.get("winterEquipmentManagementType", []) if v in INVIERNO), "")
+    if not invierno and (causa == "winterDriving" or any("chain" in v.lower() or "wintertyre" in v.lower()
+                                                         for v in campos.get("roadOrCarriagewayOrLaneManagementType", []))):
+        invierno = "equipamiento de invierno obligatorio"
+
     if gestion in CIERRES_TOTALES:
         clase = "corte"
+    elif invierno:
+        clase = "cadenas"
+        nombre, efecto = invierno, (efecto if efecto != invierno else "")
     elif causa == "accident":
         clase = "accidente"
     elif meteo or causa == "poorEnvironment":
@@ -308,7 +344,7 @@ def analizar_registro(elem, campos, kms=()):
     elif causa in OBSTACULOS:
         clase = "vehiculo"
     elif causa in ("roadMaintenance", ""):
-        clase = "cierre" if gestion in CIERRES_PARCIALES else "obra"
+        clase = "cierre" if gestion in CIERRES_PARCIALES | {"intermittentShortTermClosures"} else "obra"
     else:
         clase = "otro"
 
@@ -422,10 +458,10 @@ def incidencias_dgt(cfg, ahora):
             detalles = [sentido]
             inicio = min((r["inicio"] for r in registros if r["inicio"]), default=None)
             fin = max((r["fin"] for r in registros if r["fin"]), default=None)
+            if inicio and inicio <= ahora:
+                detalles.append(f"desde {hora_local(inicio, ahora)} ({hace(inicio, ahora)})")
             if fin:
                 detalles.append(f"hasta {hora_local(fin, ahora)}")
-            elif inicio:
-                detalles.append(f"desde {hora_local(inicio, ahora)}")
             if p["lats"] and p["lons"]:
                 detalles.append(enlace_mapa((p["lats"][0] + p["lats"][-1]) / 2,
                                             (p["lons"][0] + p["lons"][-1]) / 2))
@@ -506,6 +542,8 @@ def incidencias_madrid(cfg, ahora):
         tipo = c.get("nom_tipo_incidencia") or ("Obras" if es_obra else "Incidencia")
 
         detalles = []
+        if inicio and inicio <= ahora and clase != "obra":
+            detalles.append(f"desde {hora_local(inicio, ahora)} ({hace(inicio, ahora)})")
         if fin:
             detalles.append(f"hasta {hora_local(fin, ahora)}")
         try:
@@ -616,27 +654,112 @@ def avisos_aemet(cfg, estado, ahora):
         if not expires or expires < ahora:
             continue
         rid = f"aemet-{a['zona']}-{a['codigo']}-{a['nivel']}"
-        if rid in resultado:  # mismo aviso en varios días: nos quedamos con el primero
+        if rid in resultado:
+            # Mismo aviso en varios días seguidos: un solo aviso que dura hasta el final
+            m = resultado[rid]["meteo"]
+            if parse_fecha(m["expires"]) < expires:
+                m["expires"] = a["expires"]
+            m["valor"] = "; ".join(x for x in dict.fromkeys((m["valor"], a["valor"])) if x)
             continue
         icono, fenomeno = FENOMENOS_AEMET[a["codigo"]]
         n = NIVELES_AEMET[a["nivel"]]
-        if not onset:
-            cuando = f"hasta {dia_y_hora(expires, ahora)}"
-        elif onset.astimezone(ZONA).date() == expires.astimezone(ZONA).date():
-            cuando = f"{dia_y_hora(onset, ahora)}–{expires.astimezone(ZONA).strftime('%H:%M')}"
-        else:
-            cuando = f"{dia_y_hora(onset, ahora)} – {dia_y_hora(expires, ahora)}"
         carreteras = ", ".join(a["carreteras"])
         texto = (f"{icono}{CLASES['aemet' + str(n)][1]} <b>Aviso {a['nivel']} por {fenomeno}</b> · {esc(a['zona_nombre'])}\n"
-                 + (f"{esc(a['valor'])} · " if a["valor"] else "") + f"{cuando}\nAfecta a: {esc(carreteras)}")
+                 + (f"{esc(a['valor'])} · " if a["valor"] else "") + f"{rango_horas(onset, expires, ahora)}\n"
+                 + f"Afecta a: {esc(carreteras)}")
         resultado[rid] = {
             "grupo": "Avisos AEMET", "clase": f"aemet{n}", "icono": icono, "etiqueta": carreteras,
             "importante": True, "corte_total": n >= 3, "texto": texto,
             "corto": f"Aviso {a['nivel']} por {fenomeno} · {a['zona_nombre']}",
             "resumen": f"Aviso {a['nivel']} por {fenomeno} ({a['zona_nombre']})",
             "carretera": f"AEMET:{a['zona']}:{a['codigo']}", "direccion": "both", "km": None,
+            "meteo": {"codigo": a["codigo"], "n": n, "nivel": a["nivel"], "valor": a["valor"],
+                      "onset": a["onset"], "expires": a["expires"], "zona": a["zona_nombre"],
+                      "carreteras": a["carreteras"]},
         }
     return resultado
+
+
+def texto_prevision(actuales, ahora):
+    """Avisos de AEMET que afectan a mañana (hora local) en tus carreteras, o '' si no hay."""
+    manana = ahora.astimezone(ZONA).date() + timedelta(days=1)
+    ini = datetime.combine(manana, datetime.min.time(), ZONA)
+    fin = ini + timedelta(days=1)
+    de_manana = []
+    for v in actuales.values():
+        m = v.get("meteo")
+        if not m:
+            continue
+        on, ex = parse_fecha(m["onset"]) or ahora, parse_fecha(m["expires"])
+        if ex and ex > ini and on < fin:
+            de_manana.append(v)
+    if not de_manana:
+        return ""
+    lineas = [t for _, _, t in agrupar_meteo(de_manana, ahora)]
+    dia = manana.strftime("%d/%m")
+    return f"🌙 <b>Previsión para mañana ({dia})</b>\n\n" + "\n\n".join(lineas) + \
+        "\n\n<i>Mañana el panel te dirá cómo están las carreteras antes de salir.</i>"
+
+
+def rango_horas(onset, expires, ahora):
+    if not onset:
+        return f"hasta {dia_y_hora(expires, ahora)}"
+    if onset.astimezone(ZONA).date() == expires.astimezone(ZONA).date():
+        return f"{dia_y_hora(onset, ahora)}–{expires.astimezone(ZONA).strftime('%H:%M')}"
+    return f"{dia_y_hora(onset, ahora)} – {dia_y_hora(expires, ahora)}"
+
+
+CANTIDAD = re.compile(r"(\d+(?:[.,]\d+)?)\s*(cm|mm)\b")
+
+
+def agrupar_meteo(items, ahora):
+    """Junta los avisos de AEMET por carretera: una línea por carretera(s) y fenómeno.
+    Devuelve [(gravedad, linea_resumen, texto_panel)] ordenado de más a menos grave."""
+    por_carretera = {}
+    for v in items:
+        m = v.get("meteo")
+        if not m:
+            continue
+        for c in m["carreteras"]:
+            g = por_carretera.setdefault((c, m["codigo"]), {"n": 0, "cant": None, "onset": None,
+                                                          "expires": None, "zonas": {}})
+            g["n"] = max(g["n"], m["n"])
+            for num, unidad in CANTIDAD.findall(m["valor"] or ""):
+                valor = float(num.replace(",", "."))
+                if not g["cant"] or (g["cant"][1] == unidad and valor > g["cant"][0]):
+                    g["cant"] = (valor, unidad)
+            on, ex = parse_fecha(m["onset"]), parse_fecha(m["expires"])
+            if on and (not g["onset"] or on < g["onset"]):
+                g["onset"] = on
+            if ex and (not g["expires"] or ex > g["expires"]):
+                g["expires"] = ex
+            g["zonas"][m["zona"]] = max(g["zonas"].get(m["zona"], 0), m["n"])
+
+    # Carreteras con exactamente el mismo aviso van juntas en una línea
+    juntas = {}
+    for (c, codigo), g in por_carretera.items():
+        clave = (codigo, g["n"], g["cant"], g["onset"], g["expires"])
+        grupo = juntas.setdefault(clave, {"carreteras": [], "zonas": {}})
+        grupo["carreteras"].append(c)
+        for z, nz in g["zonas"].items():
+            grupo["zonas"][z] = max(grupo["zonas"].get(z, 0), nz)
+
+    salida = []
+    nombres_nivel = {v: k for k, v in NIVELES_AEMET.items()}
+    for (codigo, n, cant, onset, expires), grupo in juntas.items():
+        carreteras = grupo["carreteras"]
+        zonas = sorted(grupo["zonas"].items(), key=lambda z: (-z[1], z[0]))
+        icono, fenomeno = FENOMENOS_AEMET[codigo]
+        color = CLASES[f"aemet{n}"][1]
+        cuanto = f" hasta {fkm(cant[0])} {cant[1]}" if cant else ""
+        cuando = rango_horas(onset, expires, ahora) if expires else ""
+        lista = ", ".join(carreteras)
+        detalle_zonas = ", ".join(f"{z} ({nombres_nivel[nz]})" for z, nz in zonas)
+        texto = (f"{icono}{color} <b>{esc(lista)}</b>: {fenomeno}{esc(cuanto)}"
+                 + (f" · {cuando}" if cuando else "") + f"\n<i>{esc(detalle_zonas)}</i>")
+        salida.append((n, f"{icono}{color} {esc(lista)}", texto))
+    salida.sort(key=lambda s: -s[0])
+    return salida
 
 
 # ============================================================
@@ -714,15 +837,16 @@ def en_pausa(estado, ahora):
 
 def linea_resumen(actuales, calles_trafico, ahora, pausado):
     """Primera línea del panel: es lo que se ve en la barra fijada sin abrir nada."""
-    vistos, partes = set(), []
-    for v in sorted((v for v in actuales.values() if v["importante"]), key=lambda v: CLASES[v["clase"]][0]):
-        etiqueta = v.get("etiqueta") or v["grupo"]
-        # Una entrada por carretera/calle (la más grave); los avisos AEMET van aparte
-        clave = ("aemet", v["icono"], etiqueta) if v["grupo"] == "Avisos AEMET" else etiqueta
-        if clave in vistos:
-            continue
-        vistos.add(clave)
-        partes.append(f"{v['icono']} {esc(etiqueta)}")
+    # Por carretera/calle: todos sus iconos distintos, el más grave primero ("🧊❄️ A-40")
+    iconos = {}
+    for v in sorted((v for v in actuales.values() if v["importante"] and v["grupo"] != "Avisos AEMET"),
+                    key=lambda v: CLASES[v["clase"]][0]):
+        lista = iconos.setdefault(v.get("etiqueta") or v["grupo"], [])
+        if v["icono"] not in lista:
+            lista.append(v["icono"])
+    partes = [f"{''.join(i)} {esc(e)}" for e, i in iconos.items()]
+    # Avisos de AEMET ya agrupados por carretera ("❄️🟠 A-40, N-320")
+    partes += [linea for _, linea, _ in agrupar_meteo(actuales.values(), ahora)]
     for calle, t in calles_trafico.items():
         if t["nivel"] >= 3:
             partes.append(f"🔴 {esc(calle)}")
@@ -765,7 +889,9 @@ def texto_panel(cfg, actuales, calles_trafico, ahora, pausa_hasta):
                     trozos.append(f"{icono} {esc(calle)}" + (f" ({palabra})" if t["nivel"] else ""))
             linea_calles = "\n".join(trozos)
 
-        if importantes:
+        if g == "Avisos AEMET":
+            bloque = "<b>Avisos AEMET</b>\n" + "\n\n".join(t for _, _, t in agrupar_meteo(del_grupo, ahora))
+        elif importantes:
             bloque = f"<b>{esc(g)}</b>\n" + "\n\n".join(v["texto"] for v in importantes)
             extra = "\n".join(x for x in (linea_calles, "\n".join(lineas_menores)) if x)
             if extra:
@@ -913,9 +1039,15 @@ def main(ahora=None):
 
         bloques = []
         if nuevas:
-            bloques.append(("🚨 <b>Nuevo aviso</b>" if len(nuevas) == 1
-                            else f"🚨 <b>{len(nuevas)} avisos nuevos</b>"))
-            bloques.extend(v["texto"] for v in sorted(nuevas.values(), key=lambda v: CLASES[v["clase"]][0]))
+            # Tráfico: un bloque por incidencia. AEMET: agrupado por carretera, como en el panel.
+            trafico = [v["texto"] for v in sorted((v for v in nuevas.values() if not v.get("meteo")),
+                                                  key=lambda v: CLASES[v["clase"]][0])]
+            meteo = [t for _, _, t in agrupar_meteo([v for v in nuevas.values() if v.get("meteo")], ahora)]
+            if meteo:
+                meteo[0] = "<b>Avisos AEMET</b>\n" + meteo[0]
+            total = len(trafico) + len(meteo)
+            bloques.append("🚨 <b>Nuevo aviso</b>" if total == 1 else f"🚨 <b>{total} avisos nuevos</b>")
+            bloques.extend(trafico + meteo)
         if empeoran:
             bloques.append("⬆️ <b>Empeora</b>")
             bloques.extend(v["texto"] for v in empeoran.values())
@@ -941,6 +1073,16 @@ def main(ahora=None):
                     resueltas.append(info["resumen"])
         if resueltas and not pausado:
             enviar("✅ <b>Resuelto</b>\n" + "\n".join("• " + esc(r) for r in resueltas), silencioso=True)
+
+    # Previsión para mañana: una vez al día, a partir de la hora configurada, sin sonido
+    hora_prev = cfg["avisos_meteo"].get("prevision_hora")
+    local_ahora = ahora.astimezone(ZONA)
+    if hora_prev is not None and local_ahora.hour >= int(hora_prev) \
+            and estado.get("prevision_enviada") != local_ahora.date().isoformat():
+        estado["prevision_enviada"] = local_ahora.date().isoformat()
+        texto = texto_prevision(actuales, ahora)
+        if texto and not pausado:
+            enviar(texto, silencioso=True)
 
     # Errores persistentes (unos 30 min seguidos con revisión cada 5 min)
     fallos = estado.get("fallos_seguidos", 0) + 1 if errores else 0
