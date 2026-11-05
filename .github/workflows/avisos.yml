@@ -1,0 +1,68 @@
+name: Avisos de tráfico
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # cada 5 minutos (GitHub puede retrasarlo un poco)
+  workflow_dispatch:         # botón "Run workflow" para lanzarlo a mano
+
+permissions:
+  contents: write            # solo para el commit mensual que mantiene vivo el repositorio
+
+concurrency:
+  group: avisos-trafico
+  cancel-in-progress: false
+
+jobs:
+  revisar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # El estado (qué te ha avisado ya) se guarda en la caché de GitHub, no en el repositorio,
+      # para que no sea visible públicamente.
+      - name: Recuperar estado
+        uses: actions/cache/restore@v4
+        with:
+          path: estado.json
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+
+      - name: Huella del estado anterior
+        id: antes
+        run: echo "hash=$(sha256sum estado.json 2>/dev/null | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Revisar incidencias
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          CONFIG: ${{ secrets.CONFIG }}
+        run: python bot.py
+
+      - name: Huella del estado nuevo
+        id: despues
+        if: always()
+        run: echo "hash=$(sha256sum estado.json 2>/dev/null | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Guardar estado (solo si ha cambiado)
+        if: always() && steps.despues.outputs.hash != '' && steps.despues.outputs.hash != steps.antes.outputs.hash
+        uses: actions/cache/save@v4
+        with:
+          path: estado.json
+          key: estado-${{ github.run_id }}-${{ github.run_attempt }}
+
+      # GitHub pausa los workflows programados de repositorios sin actividad en 60 días.
+      - name: Mantener vivo el repositorio
+        if: always()
+        run: |
+          ultimo=$(git log -1 --format=%ct)
+          if [ $(( $(date +%s) - ultimo )) -gt $(( 40 * 86400 )) ]; then
+            git config user.name "bot-trafico"
+            git config user.email "bot-trafico@users.noreply.github.com"
+            git commit --allow-empty -m "Mantener activo el bot"
+            git push
+          fi
