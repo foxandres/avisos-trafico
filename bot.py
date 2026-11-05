@@ -841,15 +841,16 @@ def linea_resumen(actuales, calles_trafico, ahora, pausado):
     iconos = {}
     for v in sorted((v for v in actuales.values() if v["importante"] and v["grupo"] != "Avisos AEMET"),
                     key=lambda v: CLASES[v["clase"]][0]):
-        lista = iconos.setdefault(v.get("etiqueta") or v["grupo"], [])
-        if v["icono"] not in lista:
-            lista.append(v["icono"])
-    partes = [f"{''.join(i)} {esc(e)}" for e, i in iconos.items()]
-    # Avisos de AEMET ya agrupados por carretera ("❄️🟠 A-40, N-320")
-    partes += [linea for _, linea, _ in agrupar_meteo(actuales.values(), ahora)]
+        e = iconos.setdefault(v.get("etiqueta") or v["grupo"], {"iconos": [], "rango": CLASES[v["clase"]][0]})
+        if v["icono"] not in e["iconos"]:
+            e["iconos"].append(v["icono"])
+    partes = [(e["rango"], f"{''.join(e['iconos'])} {esc(nombre)}") for nombre, e in iconos.items()]
+    # Avisos de AEMET ya agrupados por carretera ("❄️🟠 A-40, N-320"); el rojo cuenta como un corte
+    partes += [(CLASES[f"aemet{n}"][0], linea) for n, linea, _ in agrupar_meteo(actuales.values(), ahora)]
     for calle, t in calles_trafico.items():
         if t["nivel"] >= 3:
-            partes.append(f"🔴 {esc(calle)}")
+            partes.append((5, f"🔴 {esc(calle)}"))
+    partes = [texto for _, texto in sorted(partes, key=lambda p: p[0])]  # lo más grave primero
     if len(partes) > MAX_EN_RESUMEN:
         partes = partes[:MAX_EN_RESUMEN] + ["…"]
     estado_txt = " · ".join(partes) if partes else "✅ Todo despejado"
@@ -1009,7 +1010,7 @@ def main(ahora=None):
     try:
         calles_trafico = trafico_calles_madrid(cfg)
     except Exception as e:
-        errores.append(f"Sensores Madrid: {type(e).__name__}")
+        errores.append(f"sensores de tráfico de Madrid: {type(e).__name__}")
         calles_trafico = estado.get("calles_trafico", {})
 
     # En pausa no se deja nada pendiente: todo se da por avisado sin mensaje
@@ -1087,7 +1088,10 @@ def main(ahora=None):
     # Errores persistentes (unos 30 min seguidos con revisión cada 5 min)
     fallos = estado.get("fallos_seguidos", 0) + 1 if errores else 0
     if fallos == 6 and not pausado:
-        enviar("⚠️ No consigo leer alguna fuente de datos desde hace un rato:\n" + "\n".join(errores))
+        fuentes = ", ".join(dict.fromkeys(e.split(":")[0] for e in errores))
+        enviar(f"⚠️ <b>Hace un rato que no consigo leer:</b> {esc(fuentes)}.\n"
+               "Lo de esa fuente puede no estar al día; el resto sigue funcionando. "
+               "Normalmente se arregla solo.", silencioso=True)
 
     estado.update({"version": VERSION_ESTADO, "incidencias": actuales, "notificadas": notificadas,
                    "ausencias": ausencias, "recientes": recientes, "fallos_seguidos": fallos,
