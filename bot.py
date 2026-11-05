@@ -12,7 +12,7 @@ Qué te AVISA (con notificación):
   - Si algo que ya te avisó empeora a corte total.
   - Cuando se resuelve un corte o accidente del que te avisó (sin sonido).
 
-Qué NO avisa (solo aparece contado en el panel fijado):
+Qué NO avisa (aparece en el panel fijado, una línea corta cada una):
   - Obras sin corte, vehículos detenidos, obstáculos, tráfico lento o denso.
 
 Para no repetir:
@@ -226,9 +226,8 @@ CLASES = {
     "obra":      (7, "🚧", False),
 }
 
-NOMBRE_MENORES = {"lento": ("tramo con tráfico lento", "tramos con tráfico lento"),
-                  "vehiculo": ("vehículo detenido u obstáculo", "vehículos detenidos u obstáculos"),
-                  "obra": ("obra sin corte", "obras sin corte")}
+MAX_MENORES_POR_TRAMO = 6
+LIMITE_PANEL = 3900  # Telegram admite 4096 caracteres por mensaje
 
 
 def campos_registro(elem):
@@ -380,7 +379,16 @@ def incidencias_dgt(cfg, ahora):
                      for r in registros[1:] if r["titular"] != titular]
             extra = [e for e in dict.fromkeys(extra) if e and e not in titular.lower()][:2]
 
-            detalles = [describir_sentido(p["direccion"], p["carretera"], cfg)]
+            sentido = describir_sentido(p["direccion"], p["carretera"], cfg)
+            mapa = ""
+            if p["lats"] and p["lons"]:
+                mapa = (f'https://maps.google.com/?q={(p["lats"][0] + p["lats"][-1]) / 2:.5f},'
+                        f'{(p["lons"][0] + p["lons"][-1]) / 2:.5f}')
+            # Línea corta para el panel (sin mapa): "A-2 km 26 · saliendo de Madrid · Tráfico lento"
+            breve = p["resto"] if p["clase"] == "lento" and p["resto"] else titular
+            corto = " · ".join(x for x in (f"{p['carretera']} {km_txt}".strip(), sentido,
+                                           breve[:1].upper() + breve[1:]) if x)
+            detalles = [sentido]
             inicio = min((r["inicio"] for r in registros if r["inicio"]), default=None)
             fin = max((r["fin"] for r in registros if r["fin"]), default=None)
             if fin:
@@ -404,6 +412,8 @@ def incidencias_dgt(cfg, ahora):
                 "corte_total": p["clase"] == "corte",
                 "texto": texto,
                 "resumen": f"{lugar}: {titular}",
+                "corto": corto,
+                "mapa": mapa,
                 "carretera": p["carretera"],
                 "direccion": p["direccion"],
                 "km": round(sum(kms) / len(kms), 1) if kms else None,
@@ -462,15 +472,17 @@ def incidencias_madrid(cfg, ahora):
         icono = CLASES[clase][1]
         tipo = c.get("nom_tipo_incidencia") or ("Obras" if es_obra else "Incidencia")
 
-        detalles = []
+        detalles, mapa = [], ""
         if fin:
             detalles.append(f"hasta {hora_local(fin, ahora)}")
         try:
             lat, lon = float(c.get("latitud", "nan")), float(c.get("longitud", "nan"))
             if lat == lat and lon == lon:  # no es NaN
                 detalles.append(enlace_mapa(lat, lon))
+                mapa = f"https://maps.google.com/?q={lat:.5f},{lon:.5f}"
         except ValueError:
             pass
+        corto = f"{calle} · {tipo}"
 
         rid = "mad-" + (c.get("id_incidencia") or c.get("codigo") or str(abs(hash(c.get("descripcion")))))
         cuerpo = f"{icono} <b>{esc(calle)}</b> · {esc(tipo)}\n{esc(resumir_descripcion(c.get('descripcion')))}"
@@ -479,6 +491,7 @@ def incidencias_madrid(cfg, ahora):
         resultado[rid] = {
             "grupo": "Calles de Madrid", "clase": clase, "importante": clase != "obra",
             "corte_total": corte_total, "texto": cuerpo, "resumen": f"{calle}: {tipo}",
+            "corto": corto, "mapa": mapa,
             "carretera": "MADRID:" + calle, "direccion": "both", "km": None,
         }
     return resultado
@@ -526,28 +539,31 @@ def texto_panel(cfg, actuales, ahora):
     grupos = [t["nombre"] for t in cfg["tramos"]]
     if cfg["calles"]:
         grupos.append("Calles de Madrid")
-    lineas = [f"🚦 <b>Estado del tráfico</b> · {hora_local(ahora, ahora, False)}"]
-    menores = {}
+    cabecera = f"🚦 <b>Estado del tráfico</b> · {hora_local(ahora, ahora, False)}"
+    bloques = []
     for g in grupos:
-        del_grupo = sorted((v for v in actuales.values() if v["grupo"] == g),
-                           key=lambda v: CLASES[v["clase"]][0])
-        importantes = [v for v in del_grupo if v["importante"]]
-        for v in del_grupo:
-            if not v["importante"]:
-                menores[v["clase"]] = menores.get(v["clase"], 0) + 1
-        if not importantes:
-            lineas.append(f"\n✅ {esc(g)}")
-            continue
-        lineas.append(f"\n<b>{esc(g)}</b>\n" + "\n\n".join(v["texto"] for v in importantes))
-    if menores:
-        partes = []
-        for clase in ("lento", "vehiculo", "obra"):
-            n = menores.get(clase)
-            if n:
-                uno, varios = NOMBRE_MENORES[clase]
-                partes.append(f"{n} {uno if n == 1 else varios}")
-        lineas.append("\n<i>Sin aviso: " + ", ".join(partes) + ".</i>")
-    return "\n".join(lineas)
+        del_grupo = [v for v in actuales.values() if v["grupo"] == g]
+        importantes = sorted((v for v in del_grupo if v["importante"]), key=lambda v: CLASES[v["clase"]][0])
+        # Sin aviso: una línea corta cada una, por tipo y kilómetro
+        menores = sorted((v for v in del_grupo if not v["importante"]),
+                         key=lambda v: (CLASES[v["clase"]][0], v.get("km") if v.get("km") is not None else 0))
+        lineas_menores = list(dict.fromkeys(f"▫️ {esc(v.get('corto') or v['resumen'])}" for v in menores))
+        if len(lineas_menores) > MAX_MENORES_POR_TRAMO:
+            sobran = len(lineas_menores) - MAX_MENORES_POR_TRAMO
+            lineas_menores = lineas_menores[:MAX_MENORES_POR_TRAMO] + [f"▫️ <i>y {sobran} más</i>"]
+
+        if importantes:
+            bloque = f"<b>{esc(g)}</b>\n" + "\n\n".join(v["texto"] for v in importantes)
+            if lineas_menores:
+                bloque += "\n\n" + "\n".join(lineas_menores)
+        else:
+            bloque = f"✅ <b>{esc(g)}</b>" + ("\n" + "\n".join(lineas_menores) if lineas_menores else "")
+        bloques.append(bloque)
+
+    texto = cabecera + "\n\n" + "\n\n".join(bloques)
+    if len(texto) > LIMITE_PANEL:
+        texto = texto[:LIMITE_PANEL - 60].rsplit("\n", 1)[0] + "\n\n<i>(recortado: hay demasiadas incidencias)</i>"
+    return texto
 
 
 def actualizar_panel(cfg, estado, actuales, ahora):
