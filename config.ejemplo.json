@@ -1,0 +1,13 @@
+{
+  "silencio_utc": [22, 5],
+  "hacia_madrid_negativo": ["A-6"],
+  "tramos": [
+    {"nombre": "A-6 Madrid ↔ Collado Villalba", "carretera": "A-6", "km_min": 0, "km_max": 42},
+    {"nombre": "N-1 zona de ejemplo", "carretera": "N-1",
+     "lat_min": 40.50, "lat_max": 40.80, "lon_min": -3.70, "lon_max": -3.50}
+  ],
+  "calles": {
+    "Paseo de la Castellana": ["castellana"],
+    "Gran Vía": ["gran via"]
+  }
+}
